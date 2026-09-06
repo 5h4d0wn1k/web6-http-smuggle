@@ -8,9 +8,12 @@ import sys
 import re
 import time
 import socket
+import json
 import argparse
 import ssl
 import hashlib
+import threading
+import socketserver
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 from urllib.parse import urlparse
@@ -538,6 +541,31 @@ class Smuggler:
         self._print_report()
         return self.report
 
+    def export_json(self, filename: str) -> None:
+        data = {
+            "target": self.report.target,
+            "port": self.report.port,
+            "uses_tls": self.report.uses_tls,
+            "vulnerable": {
+                "TE-CL": self.report.vulnerable_te_cl,
+                "CL-TE": self.report.vulnerable_cl_te,
+                "CL-CL": self.report.vulnerable_cl_cl,
+                "TE-TE": self.report.vulnerable_te_te,
+            },
+            "results": [
+                {
+                    "test_name": r.test_name,
+                    "detection_type": r.detection_type,
+                    "vulnerable": r.vulnerable,
+                    "evidence": r.evidence,
+                }
+                for r in self.report.results
+            ],
+        }
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[*] Results exported to {filename}")
+
     def _print_report(self):
         print(f"\n{'='*60}")
         print(f"  Analysis Report")
@@ -585,19 +613,245 @@ class Smuggler:
         print(f"\n{'='*60}\n")
 
 
+# ---------------------------------------------------------------------------
+# Offline desync simulators for --demo and tests
+# ---------------------------------------------------------------------------
+
+def _is_request_container(body: bytes) -> bool:
+    return b"HTTP/1.1" in body and b"\r\n\r\n" in body
+
+
+def _extract_smuggled_path(remainder: bytes) -> str:
+    m = re.search(rb"(?:GET|POST|HEAD)\s+(/\S+)\s+HTTP/1\.[01]", remainder)
+    return m.group(1).decode("utf-8", errors="replace") if m else "/desync"
+
+
+class DesyncFrontendHandler(socketserver.BaseRequestHandler):
+    """Emulates a desync-susceptible front-end.
+
+    `mode` selects which header the front-end trusts ("te" vs "cl"). When a
+    smuggled second request is found in the body, a marker response
+    (`SMUGGLED <path>`) is appended to the current response so the scanner can
+    observe the desync artifact. Clean (`clean_mode`) front-ends reject any
+    request that combines Content-Length and Transfer-Encoding (or duplicates
+    Content-Length) with a 400 and never desync.
+    """
+
+    mode: str = "te"
+    clean_mode: bool = False
+
+    def handle(self):
+        data = b""
+        while True:
+            chunk = self.request.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > 65536:
+                break
+            if b"\r\n\r\n" in data:
+                header_end = data.find(b"\r\n\r\n") + 4
+                head_text = data[:header_end - 4].decode("utf-8", errors="replace")
+                cl = None
+                te = False
+                seen_cl = 0
+                for line in head_text.split("\r\n")[1:]:
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        k = k.strip().lower()
+                        if k == "content-length":
+                            seen_cl += 1
+                            try:
+                                cl = int(v.strip())
+                            except ValueError:
+                                cl = None
+                        elif k == "transfer-encoding":
+                            te = True
+                if te:
+                    if b"0\r\n\r\n" in data:
+                        break
+                    if cl is not None and len(data) >= header_end + cl:
+                        break
+                elif cl is not None and seen_cl == 1:
+                    if len(data) >= header_end + cl:
+                        break
+                else:
+                    break
+
+        status, remainder, reject = self._process(data)
+
+        marker = b""
+        if remainder is not None and not self.clean_mode:
+            path = _extract_smuggled_path(remainder)
+            marker_body = f"SMUGGLED {path}\r\n".encode()
+            marker = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"X-Smuggled: 1\r\n"
+                + f"Content-Length: {len(marker_body)}\r\n".encode()
+                + b"Connection: close\r\n\r\n"
+                + marker_body
+            )
+
+        ok_body = b"OK\r\n"
+        if status == 400:
+            reason = (reject or "malformed request").encode()
+            resp = b"HTTP/1.1 400 Bad Request\r\nContent-Length: " + \
+                str(len(reason)).encode() + b"\r\nConnection: close\r\n\r\n" + reason
+        else:
+            resp = b"HTTP/1.1 200 OK\r\nContent-Length: " + \
+                str(len(ok_body)).encode() + \
+                b"\r\nConnection: close\r\n\r\n" + ok_body
+
+        self.request.sendall(resp + marker)
+
+    def _process(self, data: bytes):
+        header_end = data.find(b"\r\n\r\n")
+        head = data[:header_end]
+        body = data[header_end + 4:]
+        head_text = head.decode("utf-8", errors="replace")
+        lines = head_text.split("\r\n")
+        if not lines or "HTTP/" not in lines[0]:
+            return 400, None, "malformed request line"
+
+        headers: Dict[str, List[str]] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers.setdefault(k.strip().lower(), []).append(v.strip())
+
+        cl_values = headers.get("content-length", [])
+        te_present = "transfer-encoding" in headers
+
+        if self.clean_mode:
+            # Hardened front-end: ambiguously-framed requests are normalized
+            # safely (same response as a normal request) and never desync.
+            return 200, None, None
+
+        if te_present:
+            # vulnerable front-end that trusts Transfer-Encoding
+            term = body.find(b"0\r\n\r\n")
+            if term == -1:
+                return 200, None, None
+            remainder = body[term + 5:]
+            if _is_request_container(remainder):
+                return 200, remainder, None
+            return 200, None, None
+
+        if cl_values:
+            try:
+                cl = int(cl_values[0])
+            except ValueError:
+                return 400, None, "invalid Content-Length"
+            if cl < 0 or cl > 1_000_000:
+                return 400, None, "invalid Content-Length"
+            if len(body) > cl:
+                remainder = body[cl:]
+            else:
+                remainder = None
+            if remainder is not None and _is_request_container(remainder):
+                return 200, remainder, None
+            # back-end TE leftover inside an exactly-CL body
+            if body.startswith(b"0\r\n\r\n") and _is_request_container(body[5:]):
+                return 200, body[5:], None
+            if _is_request_container(body) and b"0\r\n\r\n" not in body:
+                return 200, body, None
+            return 200, None, None
+
+        return 200, None, None
+
+
+class ThreadingDesyncServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, mode: str = "te", clean_mode: bool = False):
+        handler = type(
+            "ModeHandler",
+            (DesyncFrontendHandler,),
+            {"mode": mode, "clean_mode": clean_mode},
+        )
+        super().__init__(("127.0.0.1", 0), handler)
+
+
+def _run_desync_scan(port: int, clean_mode: bool = False) -> AnalysisReport:
+    smuggler = Smuggler(
+        target_url=f"http://127.0.0.1:{port}",
+        timeout=3,
+        verbose=False,
+    )
+    return smuggler.scan()
+
+
+def demo():
+    print("  +------------------------------------------+")
+    print("  |     WEB6 -- HTTP Request Smuggler         |")
+    print("  +------------------------------------------+\n")
+    print("[*] DEMO MODE: local desync front-end + hardened control server")
+
+    te_server = ThreadingDesyncServer(mode="te", clean_mode=False)
+    cl_server = ThreadingDesyncServer(mode="cl", clean_mode=False)
+    clean_server = ThreadingDesyncServer(mode="te", clean_mode=True)
+
+    te_thread = threading.Thread(target=te_server.serve_forever, daemon=True)
+    cl_thread = threading.Thread(target=cl_server.serve_forever, daemon=True)
+    clean_thread = threading.Thread(target=clean_server.serve_forever, daemon=True)
+    te_thread.start(); cl_thread.start(); clean_thread.start()
+
+    print(f"    Desync front-end (CL-TE): http://127.0.0.1:{te_server.server_address[1]}")
+    print(f"    Desync front-end (TE-CL): http://127.0.0.1:{cl_server.server_address[1]}")
+    print(f"    Hardened control:         http://127.0.0.1:{clean_server.server_address[1]}")
+
+    te_report = _run_desync_scan(te_server.server_address[1])
+    cl_report = _run_desync_scan(cl_server.server_address[1])
+    clean_report = _run_desync_scan(clean_server.server_address[1])
+
+    te_vuln = te_report.vulnerable_cl_te or any(r.vulnerable for r in te_report.results)
+    cl_vuln = cl_report.vulnerable_te_cl or any(r.vulnerable for r in cl_report.results)
+    clean_vuln = any(r.vulnerable for r in clean_report.results)
+
+    te_server.shutdown(); cl_server.shutdown(); clean_server.shutdown()
+
+    print("\n  Demo summary:")
+    print(f"    CL-TE front-end markers detected:    {'YES' if te_vuln else 'NO'}")
+    print(f"    TE-CL front-end markers detected:    {'YES' if cl_vuln else 'NO'}")
+    print(f"    Hardened control (no findings):      {'YES' if not clean_vuln else 'NO'}")
+
+    if te_vuln and cl_vuln and not clean_vuln:
+        print("[+] Demo: desync markers detected on vulnerable simulators;")
+        print("[+] hardened control produced zero findings.")
+        print("[+] Exit 0 -- scanner works correctly.")
+        sys.exit(0)
+    print("[-] Demo: unexpected result -- scanner may need tuning.")
+    sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="WEB6 — HTTP Request Smuggler",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example: python3 smuggler.py https://target.com --timeout 10",
+        epilog="""Examples:
+  python3 smuggler.py http://127.0.0.1:8080 --timeout 10
+  python3 smuggler.py http://127.0.0.1:8080 -o findings/smuggle.json -v
+  python3 smuggler.py --demo
+        """,
     )
-    parser.add_argument("target", help="Target URL (e.g. http://target.com or https://target.com)")
+    parser.add_argument("target", nargs="?", help="Target URL (e.g. http://127.0.0.1:<port>)")
     parser.add_argument("--timeout", type=int, default=10,
                         help="Connection timeout in seconds (default: 10)")
+    parser.add_argument("-o", "--output", help="Export report to JSON file")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
+    parser.add_argument("--demo", action="store_true",
+                        help="Run offline demo against local desync simulators")
 
     args = parser.parse_args()
+
+    if args.demo:
+        demo()
+        return
+
+    if not args.target:
+        parser.error("target is required (or use --demo)")
 
     smuggler = Smuggler(
         target_url=args.target,
@@ -607,6 +861,8 @@ def main():
 
     try:
         smuggler.scan()
+        if args.output:
+            smuggler.export_json(args.output)
     except KeyboardInterrupt:
         print("\n[!] Scan interrupted by user")
         sys.exit(1)

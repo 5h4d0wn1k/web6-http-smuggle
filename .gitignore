@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+findings/
+logs/
+output/

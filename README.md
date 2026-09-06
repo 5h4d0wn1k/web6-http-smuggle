@@ -32,15 +32,31 @@ python3 --version  # Requires Python 3.7+
 ## Usage
 
 ```bash
-# Basic scan (auto-detects HTTP/HTTPS)
-python3 smuggler.py https://target.com
+# Offline demo: local CL-TE/TE-CL desync simulators + hardened control (exit 0)
+python3 smuggler.py --demo
+
+# Lab target (loopback / RFC-5737 only)
+python3 smuggler.py http://127.0.0.1:<port>
 
 # With verbose output
-python3 smuggler.py https://target.com -v
+python3 smuggler.py http://127.0.0.1:<port> -v
+
+# Export report to JSON
+python3 smuggler.py http://127.0.0.1:<port> -o findings/smuggle.json
 
 # Custom timeout
-python3 smuggler.py http://target.com --timeout 15
+python3 smuggler.py http://127.0.0.1:<port> --timeout 15
 ```
+
+## CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `target` | Target URL (e.g. http://127.0.0.1:<port>) |
+| `--timeout` | Connection timeout in seconds (default: 10) |
+| `-o, --output` | Export report to a JSON file |
+| `-v, --verbose` | Verbose output |
+| `--demo` | Offline demo against local desync simulators |
 
 ## Example Output
 
@@ -48,7 +64,7 @@ python3 smuggler.py http://target.com --timeout 15
 ============================================================
   WEB6 — HTTP Request Smuggler
 ============================================================
-  Target:  target.com:443
+  Target:  127.0.0.1:8080
   TLS:     True
   Path:    /
   Timeout: 10s
@@ -75,7 +91,7 @@ python3 smuggler.py http://target.com --timeout 15
 ============================================================
   Analysis Report
 ============================================================
-  Target:    target.com:443
+  Target:    127.0.0.1:8080
   TLS:       True
 ============================================================
 
@@ -126,6 +142,45 @@ If you discover vulnerabilities using this tool, follow responsible disclosure p
 1. Report to the vendor/owner privately
 2. Allow reasonable time for remediation
 3. Do not exploit beyond proof of concept
+
+
+
+## Running the Demo and Tests
+
+`smuggler.py --demo` runs the full raw-socket detection engine against three local
+simulators:
+
+- **Desync front-end (CL-TE)** — trusts `Transfer-Encoding`; bodies that hide a
+  second request after the `0\r\n\r\n` terminator leak a `SMUGGLED <path>` marker
+  into the response.
+- **Desync front-end (TE-CL)** — trusts `Content-Length`; leftover request bytes
+  after the CL-bounded body also leak the marker.
+- **Hardened control** — normalizes ambiguous framing (CL+TE, duplicate CL) safely
+  and never desyncs; the scanner must report zero findings against it.
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Live Lab Test Plan
+
+Test only against systems in your own lab (e.g. two local proxies on 127.0.0.1
+configured so one trusts CL and the other trusts TE, pointed at a loopback backend):
+
+1. Deploy a two-proxy chain where the front-end and back-end disagree on CL vs TE.
+2. Run `python3 smuggler.py http://127.0.0.1:<frontend_port> -v` and confirm the
+   desync markers (`SMUGGLED`) appear in generated payloads.
+3. Replace the chain with a proxy that rejects ambiguous framing and confirm zero
+   findings.
+4. Collect the marker evidence (`X-Smuggled` header, `SMUGGLED <path>` body) into
+   the lab report.
+
+## Metrics
+
+- **Video metric**: 60-second screencast of `python3 smuggler.py --demo` (desync
+  markers detected on the vulnerable simulators, hardened control zero findings) and
+  `python3 -m unittest discover -s tests -v`, recorded against loopback targets only.
+- **Pass rate**: all unit tests green; demo exit 0.
 
 ## License
 
